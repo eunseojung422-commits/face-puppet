@@ -251,7 +251,7 @@
       <span class="zzz z1">z</span><span class="zzz z2">z</span><span class="zzz z3">z</span>
     </div>
 
-    <div id="hint">
+    <div id="hint" style="display:none;"> <!-- 내장 캐릭터가 자동으로 준비되니까 새로고침할 때마다 이게 잠깐씩 보이지 않도록 기본은 숨김. "다른 GLB 불러오기" 버튼 눌렀을 때만 JS가 다시 보여줌 -->
       <h1>표정을 그대로, 캐릭터에게</h1>
       <p>블렌드셰이프(모프 타겟)가 포함된 GLB 파일을 불러오면, 웹캠으로 잡은 당신의 표정을 캐릭터가 실시간으로 따라 짓습니다.</p>
       <label class="drop-zone" id="drop-zone">
@@ -883,6 +883,7 @@
 <script type="module">
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { FaceLandmarker, PoseLandmarker, HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
@@ -1369,8 +1370,19 @@ function animate(){
   }catch(e){ /* 스크립트 초기 로드 중 첫 프레임에는 아직 컨트롤 변수가 준비 안 됐을 수 있어 무시 */ }
   // 제스처 애니메이션이 재생 중일 땐 숨쉬기(어깨·가슴·척추 idle)와 머리카락 물리 시뮬레이션을 잠깐 멈춤 —
   // 둘 다 애니메이션 클립이 쓰는 본(척추·어깨·머리카락)을 매 프레임 통째로 덮어써서, 안 멈추면 클립 움직임이 안 보임.
-  try{ if(!isAnyClipPlaying()) updateShoulderIdle(); }catch(e){ /* 위와 동일한 이유로 무시 */ }
-  try{ if(!isAnyClipPlaying()) updateHairPhysics(); }catch(e){ /* 위와 동일한 이유로 무시 */ }
+  let playingNow = false;
+  try{ playingNow = isAnyClipPlaying(); }catch(e){ /* 위와 동일한 이유로 무시 */ }
+  try{
+    if(wasClipPlayingLastFrame && !playingNow){
+      // 애니메이션이 방금 끝난 순간 — 그 마지막 자세를 스냅샷 떠서, 지금부터 idle로 부드럽게 이어붙임
+      startBoneTransition();
+    }
+  }catch(e){ /* 스크립트 초기 로드 중 첫 프레임에는 아직 이 아래에서 선언되는 변수가 준비 안 됐을 수 있어 무시 */ }
+  try{ if(!playingNow) updateShoulderIdle(); }catch(e){ /* 위와 동일한 이유로 무시 */ }
+  try{ if(!playingNow) updateHairPhysics(); }catch(e){ /* 위와 동일한 이유로 무시 */ }
+  // idle이든 애니메이션이든, 이번 프레임에 "목표 자세"가 이미 다 세팅된 다음에 전환 보간을 얹음
+  try{ applyBoneTransitionBlend(); }catch(e){}
+  try{ wasClipPlayingLastFrame = playingNow; }catch(e){ /* 위와 동일한 이유로 무시 */ }
   if(transformControls.enabled && !gizmoDragging){
     try{ positionGizmoProxyAtCenter(); }catch(e){ /* 캐릭터 전환 중 잠깐 currentModel이 비어있을 때 무시 */ }
   }
@@ -1384,6 +1396,14 @@ animate();
 let currentModel = null;
 let currentMixer = null;   // 지금 캐릭터의 애니메이션 클립을 재생하는 믹서
 let currentClips = [];     // 지금 캐릭터의 애니메이션 클립들(GLB에 들어있던 것 그대로)
+// [최적화] 내장 캐릭터 4명은 한 번 파싱(loader.parse)한 결과(gltf.scene + animations)를 여기 캐시해두고
+// 재사용함 — 전환할 때마다 무거운 GLB 디코딩을 다시 안 해도 돼서 훨씬 빠르게 넘어감.
+const parsedGltfCache = {};
+// [최적화] "본 찾기 + 모프 수집 + 충돌체 계산 + 크기/위치 정규화"까지 끝낸 결과(rig)를 캐릭터별로 캐시해둠.
+// 한 번이라도 셋업된 캐릭터는 다음에 다시 전환할 때 이 무거운 계산(트리 순회 수십 번 + 정점 단위
+// 바운딩박스 계산)을 다시 안 하고 바로 복원만 하면 돼서 거의 즉시 전환됨.
+const characterRigCache = {};
+let backgroundPrestageScheduled = false;
 let morphMeshes = []; // { mesh, dict, arkitTarget: [name per morph index] }
 let headBone = null;
 let headBoneRestQuat = null;
@@ -1425,7 +1445,11 @@ let hairBones = {};
 let hairRestQuats = {};
 let hairSwingState = {}; // 같은 키 -> [{x,vx,y,vy,z,vz}, ...] (스프링 물리 상태)
 
+// Draco로 압축된 GLB도 바로 열 수 있게 미리 준비해둠 — 압축 안 된 기존 GLB는 이거 있어도 그냥 평소처럼 열림(호환 안 깨짐).
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
 const loader = new GLTFLoader();
+loader.setDRACOLoader(dracoLoader);
 
 // 가슴(상부 흉곽) 본 찾기 — "chest", "upper_chest", Rigify의 spine.003을 우선 확인
 function findChestBone(root){
@@ -1540,12 +1564,16 @@ function findBoneSmart(root, exactPattern, fuzzyKeyword, side){
 function clearModel(){
   if(currentModel){
     scene.remove(currentModel);
-    currentModel.traverse(o=>{
-      if(o.geometry) o.geometry.dispose();
-      if(o.material){
-        (Array.isArray(o.material)?o.material:[o.material]).forEach(m=>m.dispose());
-      }
-    });
+    // 캐시된(내장) 캐릭터는 다음에 또 쓸 거라 geometry/material을 지우지 않고 그냥 씬에서만 뺌.
+    // 캐시 대상이 아닌(직접 업로드한) 캐릭터만 예전처럼 완전히 정리해서 메모리 누수를 막음.
+    if(!currentModel.userData.__cached){
+      currentModel.traverse(o=>{
+        if(o.geometry) o.geometry.dispose();
+        if(o.material){
+          (Array.isArray(o.material)?o.material:[o.material]).forEach(m=>m.dispose());
+        }
+      });
+    }
   }
   currentModel = null;
   morphMeshes = [];
@@ -1635,7 +1663,8 @@ function materialNeedsTransparency(m, orig){
   return null; // 검사 불가(교차출처 등)
 }
 
-function fixTransparencyLayering(root){
+function fixTransparencyLayering(root, updateUI){
+  if(updateUI === undefined) updateUI = true;
   let autoFixedCount = 0, keptCount = 0, unknownCount = 0;
 
   root.traverse(o=>{
@@ -1705,8 +1734,8 @@ function fixTransparencyLayering(root){
     });
   });
 
-  // 자동 모드일 때 어떻게 판정했는지 패널에 알려줌
-  const infoEl = document.getElementById('alpha-info');
+  // 자동 모드일 때 어떻게 판정했는지 패널에 알려줌 (지금 화면에 보이는 캐릭터가 아니면 건드리지 않음)
+  const infoEl = updateUI ? document.getElementById('alpha-info') : null;
   if(infoEl){
     if(transparencyMode === 'auto'){
       if(!autoFixedCount && !keptCount){
@@ -1734,7 +1763,8 @@ let morphRepairEnabled = true;
 // 좌우가 확실히 분리돼 있어야 하는 모프들 (mouthLeft/Right처럼 입 전체가 한쪽으로 가는 건 제외)
 const ONE_SIDED_MORPH_PATTERN = /^(eyeBlink|eyeSquint|eyeWide|eyeLook|eyeAngry|browDown|browOuterUp|mouthSmile|cheekSquint|noseSneer)/;
 
-function repairAsymmetricMorphs(root, enable){
+function repairAsymmetricMorphs(root, enable, updateUI){
+  if(updateUI === undefined) updateUI = true;
   let repaired = 0;
 
   root.traverse(o=>{
@@ -1814,7 +1844,7 @@ function repairAsymmetricMorphs(root, enable){
     });
   });
 
-  const el = document.getElementById('morph-repair-info');
+  const el = updateUI ? document.getElementById('morph-repair-info') : null;
   if(el) el.textContent = enable
     ? (repaired ? `✓ 좌우가 섞인 모프 ${repaired}개를 정리했어요.` : '좌우가 섞인 모프는 없었어요.')
     : '좌우 모프 정리를 껐어요.';
@@ -1822,6 +1852,12 @@ function repairAsymmetricMorphs(root, enable){
 
 function refreshTransparency(){
   if(currentModel) fixTransparencyLayering(currentModel);
+  // 백그라운드에 미리 준비해둔(지금은 안 보이는) 다른 캐릭터들도 재질 모드를 최신으로 맞춰둠 —
+  // 안 그러면 나중에 그 캐릭터로 넘어갔을 때 예전 투명도 설정이 그대로 남아있게 됨
+  Object.keys(characterRigCache).forEach(id=>{
+    const bundle = characterRigCache[id];
+    if(bundle && bundle.model && bundle.model !== currentModel) fixTransparencyLayering(bundle.model, false);
+  });
 }
 
 // 카메라를 바스트샷(어깨~머리)으로 프레이밍.
@@ -2071,60 +2107,304 @@ function frameCameraOnBust(){
   controls.minDistance = 0.12;
 }
 
-function loadGLBFromArrayBuffer(buffer, onDone){
+// id가 캐시에 이미 있으면(내장 캐릭터를 이전에 한 번이라도 보여준 적 있으면) 무거운 GLB 파싱을
+// 건너뛰고 그 결과를 그대로 재사용함 — 전환이 훨씬 빨라짐. 처음 보는 캐릭터거나 캐시 대상이 아니면
+// (직접 업로드한 파일 등) 예전처럼 loader.parse부터 새로 함.
+function loadGLBFromArrayBuffer(buffer, id, onDone){
+  const cached = id ? parsedGltfCache[id] : null;
+  if(cached){
+    setupLoadedCharacter(cached, id);
+    if(onDone) onDone();
+    return;
+  }
   loader.parse(buffer, '', (gltf)=>{
-    clearModel();
-    currentModel = gltf.scene;
+    if(id && EMBEDDED_CHARACTER_NAMES.includes(id)) parsedGltfCache[id] = gltf;
+    setupLoadedCharacter(gltf, id);
+    if(onDone) onDone();
+  }, (err)=>{
+    console.error(err);
+    setStatus(false, 'GLB 파싱 실패');
+    alert('GLB 파일을 읽는 중 문제가 발생했어요. Shape Keys / Skinning 옵션을 체크하고 다시 내보내보세요.');
+    if(onDone) onDone(err);
+  });
+}
 
-    // 모델 크기/위치 정규화
-    const box = computeRobustBox3(currentModel);
-    const size = new THREE.Vector3(); box.getSize(size);
-    const center = new THREE.Vector3(); box.getCenter(center);
-    // 예전엔 가로/세로/깊이 중 가장 큰 값으로 정규화했는데, 캐릭터마다 머리카락이 옆으로 넓게
-    // 퍼진 정도가 달라서 그 "가장 큰 값"이 키가 아니라 머리카락 폭이 되는 경우가 있었음.
-    // 그러면 카메라(키 기준으로 한 번만 맞춰짐)에서 캐릭터마다 실제 화면 높이가 달라져서
-    // 캐릭터별로 "크기" 값을 일일이 다르게 맞춰야 하는 문제가 있었음.
-    // 그래서 세로(키) 하나만 기준으로 정규화 — 이러면 다들 화면에서 같은 키로 나와서 크기를 안 맞춰도 됨.
-    const maxDim = size.y || 1;
-    const scale = 1.6 / maxDim;
-    modelBaseScale = scale; // "크기" 슬라이더가 이 값을 기준으로 배율을 곱함
-    currentModel.scale.setScalar(scale);
-    const box2 = computeRobustBox3(currentModel);
-    currentModel.position.y -= box2.min.y;
-    currentModel.position.x -= (box2.min.x + box2.max.x)/2 * 1; // 대략 중앙정렬은 scale 적용 후 재계산 생략, 아래서 재조정
-    currentModel.position.x = -( (box2.min.x+box2.max.x)/2 );
-    currentModel.position.z = -( (box2.min.z+box2.max.z)/2 );
+// 캐릭터 하나를 화면에 실제로 등장시키기 전에 필요한 무거운 계산(본 찾기, 모프 수집, 충돌체,
+// 크기/위치 정규화용 바운딩박스)을 전부 끝내서 "번들"로 돌려주는 함수.
+// 씬에 추가하거나 activeCharIndex 등 "지금 보여줄 캐릭터가 이거다"에 해당하는 전역 상태는 건드리지
+// 않아서, 화면엔 아직 안 보이는 캐릭터(백그라운드로 미리 준비 중인 다음 캐릭터)에도 안전하게 쓸 수 있음.
+function computeCharacterRig(gltf, id){
+  const model = gltf.scene;
+  model.scale.set(1,1,1);
+  model.position.set(0,0,0);
+  model.rotation.set(0,0,0);
+  if(id && EMBEDDED_CHARACTER_NAMES.includes(id)) model.userData.__cached = true;
+
+  // 모델 크기/위치 정규화 — 세로(키) 하나만 기준으로 정규화(사유는 예전 주석 참고: 캐릭터마다
+  // 머리카락이 옆으로 퍼진 정도가 달라 "가장 큰 값"으로 맞추면 캐릭터별 실제 화면 높이가 달라짐).
+  const box = computeRobustBox3(model);
+  const size = new THREE.Vector3(); box.getSize(size);
+  const maxDim = size.y || 1;
+  const scale = 1.6 / maxDim;
+  model.scale.setScalar(scale);
+  const box2 = computeRobustBox3(model);
+  const basePosition = {
+    x: -((box2.min.x + box2.max.x) / 2),
+    y: -box2.min.y,
+    z: -((box2.min.z + box2.max.z) / 2),
+  };
+  model.position.set(basePosition.x, basePosition.y, basePosition.z);
+
+  // 머리 본은 항상 실시간 웹캠 얼굴 트래킹에게만 맡김(applyFaceResult에서 매 프레임 덮어씀) —
+  // 그래서 애니메이션 클립을 만들기 "전에" 먼저 찾아서, 클립에 머리 본 키프레임이 있으면 미리 제거함.
+  // (클립에 머리 움직임이 같이 들어있으면 실시간 트래킹이랑 매 프레임 서로 덮어쓰기 경합이 나서,
+  // 특히 애니메이션이 막 시작되는 순간 지금 짓고 있는 표정/얼굴 각도랑 확 어긋나 보이는 문제가 있었음)
+  const headBoneR = findHeadBone(model);
+  const headBoneRestQuatR = headBoneR ? headBoneR.quaternion.clone() : null;
+
+  // 애니메이션 클립이 있으면 믹서를 만들어서 계속 들고 있음(제스처 인식되면 이걸로 재생함).
+  // 만들자마자 0초(첫 키프레임) 포즈를 한 번 적용해서 이 캐릭터의 "기본 자세"로 삼음 —
+  // 아래에서 각 본의 rest 쿼터니언을 캡처하기 "전에" 해야, 그 이후 모든 로직(팔 idle, 손가락,
+  // 머리카락 등)이 이 포즈를 기준으로 동작하게 됨.
+  const clips = gltf.animations || [];
+  if(headBoneR){
+    clips.forEach(clip=>{
+      clip.tracks = clip.tracks.filter(t => !t.name.startsWith(headBoneR.name + '.'));
+    });
+  }
+  const mixer = clips.length ? new THREE.AnimationMixer(model) : null;
+  if(mixer){
+    clips.forEach(clip => mixer.clipAction(clip).play());
+    mixer.setTime(0);
+    mixer.stopAllAction();
+  }
+
+  const morphMeshesR = [];
+  model.traverse(o=>{
+    if(o.isMesh && o.morphTargetDictionary && Object.keys(o.morphTargetDictionary).length){
+      morphMeshesR.push({ mesh:o, dict:o.morphTargetDictionary });
+    }
+  });
+
+  // 화면에 실제로 보이는 캐릭터일 때만 패널 텍스트를 갱신하도록, updateUI=false로 호출
+  // (실제 활성화될 때 setupLoadedCharacter가 필요하면 다시 갱신함)
+  fixTransparencyLayering(model, false);
+  repairAsymmetricMorphs(model, morphRepairEnabled, false);
+
+  const chestBoneR = findChestBone(model);
+  const chestRestQuatR = chestBoneR ? chestBoneR.quaternion.clone() : null;
+  const spine02BoneR = findSpineSegment(model, 2);
+  const spine02RestQuatR = spine02BoneR ? spine02BoneR.quaternion.clone() : null;
+  const spine01BoneR = findSpineSegment(model, 1);
+  const spine01RestQuatR = spine01BoneR ? spine01BoneR.quaternion.clone() : null;
+  const breastBoneLR = findBreastBone(model, 'L');
+  const breastRestQuatLR = breastBoneLR ? breastBoneLR.quaternion.clone() : null;
+  const breastBoneRR = findBreastBone(model, 'R');
+  const breastRestQuatRR = breastBoneRR ? breastBoneRR.quaternion.clone() : null;
+
+  // 팔 본 탐색 (ORG- 접두사가 있어도/없어도 매칭)
+  const armBonesR = {
+    shoulderL: findBoneExact(model, /^(?:ORG-)?shoulder\.?L(\.\d+)?$/i),
+    upperArmL: findBoneExact(model, /^(?:ORG-)?upper_?arm\.?L(\.\d+)?$/i),
+    forearmL:  findBoneExact(model, /^(?:ORG-)?forearm\.?L(\.\d+)?$/i),
+    shoulderR: findBoneExact(model, /^(?:ORG-)?shoulder\.?R(\.\d+)?$/i),
+    upperArmR: findBoneExact(model, /^(?:ORG-)?upper_?arm\.?R(\.\d+)?$/i),
+    forearmR:  findBoneExact(model, /^(?:ORG-)?forearm\.?R(\.\d+)?$/i),
+    handL: findBoneExact(model, /^(?:ORG-)?hand\.?L(\.\d+)?$/i),
+    handR: findBoneExact(model, /^(?:ORG-)?hand\.?R(\.\d+)?$/i),
+  };
+
+  // 팔-몸통/머리 충돌 감지용 콜라이더: 실제 이 캐릭터의 메시 정점으로부터 바운딩 박스를 직접 만듦
+  const colliders = computeArmCollidersFor(model, { chestBone: chestBoneR, spine01Bone: spine01BoneR, spine02Bone: spine02BoneR, armBones: armBonesR, headBone: headBoneR });
+
+  // 손가락 본 탐색: rigify 표준 이름 — 엄지는 thumb.01~03, 나머지는 f_index/f_middle/f_ring/f_pinky.01~03 (.L/.R)
+  const fingerBonesR = { L:{}, R:{} };
+  const fingerRestQuatsR = { L:{}, R:{} };
+  let fingerFound = 0;
+  ['L','R'].forEach(side=>{
+    FINGER_NAMES.forEach(finger=>{
+      const bones = [1,2,3].map(seg=>
+        findBoneExact(model, new RegExp(`^(?:ORG-)?f?_?${finger}\\.?0${seg}\\.?${side}(\\.\\d+)?$`,'i'))
+      );
+      fingerBonesR[side][finger] = bones;
+      fingerRestQuatsR[side][finger] = bones.map(b=> b ? b.quaternion.clone() : null);
+      fingerFound += bones.filter(Boolean).length;
+    });
+  });
+
+  // 머리카락 본 탐색: hair.01~04.L/R 또는 hair01~04L/R (점 있어도/없어도 매칭)
+  const hairBonesR = {};
+  const hairRestQuatsR = {};
+  ['L','R'].forEach(side=>{
+    const bones = [1,2,3,4].map(seg=>
+      findBoneExact(model, new RegExp(`^(?:ORG-)?hair\\.?0${seg}\\.?${side}(\\.\\d+)?$`,'i'))
+    );
+    hairBonesR[side] = bones;
+    hairRestQuatsR[side] = bones.map(b=> b ? b.quaternion.clone() : null);
+  });
+  let hairFound = (hairBonesR.L||[]).filter(Boolean).length + (hairBonesR.R||[]).filter(Boolean).length;
+
+  // 좌우 구분 있는 이름을 못 찾았으면, 좌우 구분 없는 단일 체인(hair, hair.01, hair.02...)도 시도
+  if(hairFound === 0){
+    const centerBones = [1,2,3,4].map(seg=>
+      findBoneExact(model, new RegExp(`^(?:ORG-)?hair\\.?0${seg}(\\.\\d+)?$`,'i'))
+    );
+    if(centerBones.some(Boolean)){
+      hairBonesR.C = centerBones;
+      hairRestQuatsR.C = centerBones.map(b=> b ? b.quaternion.clone() : null);
+      hairFound = centerBones.filter(Boolean).length;
+    }
+  }
+
+  // 요청하신 대로: 포포를 뺀 나머지 캐릭터(부부·피피·링링)는 왼쪽 머리카락 체인(hair.01~04.L)을
+  // 이름이 딱 맞지 않아 자동으로 못 찾는 경우가 있어서, 실제 본 이름(hair01~04)으로 직접 지정해줌.
+  // 자동 매핑이 이미 잘 찾았으면 덮어쓰지 않고, 못 찾은 자리만 채워 넣음.
+  if(id && id !== 'PoPo_Blend_Shape.glb'){
+    const forcedHairNames = ['hair01','hair02','hair03','hair04'];
+    if(!hairBonesR.L) hairBonesR.L = [null,null,null,null];
+    if(!hairRestQuatsR.L) hairRestQuatsR.L = [null,null,null,null];
+    forcedHairNames.forEach((boneName, seg)=>{
+      if(hairBonesR.L[seg]) return; // 이미 자동으로 찾은 자리는 그대로 둠
+      const found = findBoneByName(model, boneName);
+      if(found){
+        hairBonesR.L[seg] = found;
+        hairRestQuatsR.L[seg] = found.quaternion.clone();
+      }
+    });
+    hairFound = (hairBonesR.L||[]).filter(Boolean).length + (hairBonesR.R||[]).filter(Boolean).length + (hairBonesR.C||[]).filter(Boolean).length;
+  }
+
+  // 눈 관련 본 처리: 이름이 "eye"로 시작하는 본(eyebrow 제외)을 찾아 머리 본의 자식으로 재부모화
+  // (attach()는 월드 변환을 유지한 채 부모만 바꿔주므로 바인드 포즈가 깨지지 않음)
+  const eyeSlaveBonesR = [];
+  if(headBoneR){
+    const strays = [];
+    model.traverse(o=>{
+      if((o.isBone || o.type === 'Bone') && /^eye(?!brow)/i.test(o.name)){
+        let p = o.parent, isUnderHead = false;
+        while(p){ if(p === headBoneR){ isUnderHead = true; break; } p = p.parent; }
+        if(!isUnderHead) strays.push(o);
+      }
+    });
+    strays.forEach(b=>{ try{ headBoneR.attach(b); }catch(err){ console.warn('눈 본 재부모화 실패:', b.name, err); } });
+  }
+
+  const armRestQuatsR = {};
+  Object.keys(armBonesR).forEach(k=>{
+    if(armBonesR[k]) armRestQuatsR[k] = armBonesR[k].quaternion.clone();
+  });
+  // [IK 실험] 위팔→팔꿈치, 아래팔→손목 각 본이 쉬는 자세에서 향하던 방향을 캐시
+  function ikBoneForwardLocal(childBone){
+    if(!childBone) return null;
+    const d = childBone.position.clone();
+    return d.lengthSq() > 1e-10 ? d.normalize() : null;
+  }
+  const armBoneForwardLocalR = {
+    upperArmL: ikBoneForwardLocal(armBonesR.forearmL),
+    upperArmR: ikBoneForwardLocal(armBonesR.forearmR),
+    forearmL: ikBoneForwardLocal(armBonesR.handL),
+    forearmR: ikBoneForwardLocal(armBonesR.handR)
+  };
+  const armsFound = Object.values(armBonesR).filter(Boolean).length;
+
+  return {
+    id, model, scale, basePosition,
+    clips, mixer,
+    morphMeshes: morphMeshesR,
+    headBone: headBoneR, headBoneRestQuat: headBoneRestQuatR,
+    chestBone: chestBoneR, chestRestQuat: chestRestQuatR,
+    spine01Bone: spine01BoneR, spine01RestQuat: spine01RestQuatR,
+    spine02Bone: spine02BoneR, spine02RestQuat: spine02RestQuatR,
+    breastBoneL: breastBoneLR, breastRestQuatL: breastRestQuatLR,
+    breastBoneR: breastBoneRR, breastRestQuatR: breastRestQuatRR,
+    armBones: armBonesR, armRestQuats: armRestQuatsR, armBoneForwardLocal: armBoneForwardLocalR,
+    fingerBones: fingerBonesR, fingerRestQuats: fingerRestQuatsR, fingerFoundCount: fingerFound,
+    hairBones: hairBonesR, hairRestQuats: hairRestQuatsR, hairFound,
+    eyeSlaveBones: eyeSlaveBonesR,
+    colliders,
+    armsFoundCount: armsFound,
+  };
+}
+
+// 사용자가 처음으로 캐릭터 하나를 실제로 띄운 직후, 나머지 내장 캐릭터들도 화면엔 안 보이지만
+// 본 찾기·모프 수집·충돌체 계산까지 미리 다 끝내둠(캐시에 저장) — 나중에 그 캐릭터로 넘어갈 때는
+// 이미 다 준비돼 있어서 무거운 재계산 없이 거의 즉시 전환됨. 한 캐릭터씩 살짝 텀을 두고 처리해서
+// 지금 보여주고 있는 캐릭터 쪽 메인 스레드를 한 번에 오래 붙잡지 않게 함.
+//
+// [중요] 본 찾기만으로는 부족함 — 브라우저(GPU)는 어떤 재질을 "처음으로 실제 화면에 그릴 때"
+// 셰이더 컴파일뿐 아니라 정점 버퍼(위치·법선·스킨 웨이트)와 모프 타겟 데이터를 GPU로 올리는 작업까지
+// 하는데, 이 전체 비용이 캐릭터 하나당 1초가 넘게 걸림(실측: renderer.compile()만으론 캐릭터당
+// 약 250ms만 줄고, 그 뒤에도 첫 renderer.render() 자체가 1250ms 가까이 걸렸음 — compile()은
+// 셰이더만 준비할 뿐 버퍼 업로드까지는 안 해주기 때문). 이걸 안 해두면 본은 다 준비돼 있어도 그
+// 캐릭터로 처음 넘어가는 순간(=마침 손동작으로 애니메이션도 막 시작되는 순간과 겹침) 눈에 띄게
+// 뚝 끊기는 걸로 나타남 — "애니메이션이 처음 재생될 때 버벅거림"의 실제 원인이 바로 이거였음.
+// 그래서 compile() 대신 실제 렌더(renderer.render())를 한 번 몰래 돌려서 셰이더·버퍼·모프
+// 데이터까지 전부 미리 GPU에 올려둠 — 화면엔 안 보이게, add→render→remove를 한 번에(중간에
+// 프레임이 끼지 않게) 처리함. 이 방식은 캐릭터당 1초 이상 메인 스레드를 막기 때문에, 앱을 막 켠
+// 직후(사용자가 아직 활발히 상호작용하기 전) 한꺼번에 몰아서 끝내는 걸 택함 — 그 뒤로는 전환이
+// 완전히 매끈해짐.
+function scheduleBackgroundCharacterPrestage(){
+  if(backgroundPrestageScheduled) return;
+  backgroundPrestageScheduled = true;
+  const queue = EMBEDDED_CHARACTER_NAMES.filter(name => !characterRigCache[name]);
+  let i = 0;
+  function step(){
+    if(i >= queue.length) return;
+    const name = queue[i++];
+    try{
+      const gltf = parsedGltfCache[name];
+      if(gltf && !characterRigCache[name]){
+        const rig = computeCharacterRig(gltf, name);
+        characterRigCache[name] = rig;
+        try{
+          scene.add(rig.model);
+          renderer.render(scene, camera);
+        } finally {
+          scene.remove(rig.model);
+        }
+      }
+    }catch(err){
+      console.warn('백그라운드 캐릭터 준비 실패(나중에 전환할 때 다시 시도됨):', name, err);
+    }
+    setTimeout(step, 120);
+  }
+  setTimeout(step, 600); // 방금 보여준 캐릭터 화면이 먼저 안정된 다음 시작
+}
+
+function setupLoadedCharacter(gltf, id){
+    clearModel();
+
+    let bundle = id ? characterRigCache[id] : null;
+    if(!bundle){
+      bundle = computeCharacterRig(gltf, id);
+      if(id && EMBEDDED_CHARACTER_NAMES.includes(id)) characterRigCache[id] = bundle;
+    }
+
+    currentModel = bundle.model;
+    currentModel.scale.setScalar(bundle.scale);
+    currentModel.position.set(bundle.basePosition.x, bundle.basePosition.y, bundle.basePosition.z);
+    currentModel.rotation.set(0,0,0);
+    modelBaseScale = bundle.scale; // "크기" 슬라이더가 이 값을 기준으로 배율을 곱함
 
     scene.add(currentModel);
 
-    // 애니메이션 클립이 있으면 믹서를 만들어서 계속 들고 있음(제스처 인식되면 이걸로 재생함).
-    // 만들자마자 0초(첫 키프레임) 포즈를 한 번 적용해서 이 캐릭터의 "기본 자세"로 삼음 —
-    // 아래에서 각 본의 rest 쿼터니언을 캡처하기 "전에" 해야, 그 이후 모든 로직(팔 idle, 손가락,
-    // 머리카락 등)이 이 포즈를 기준으로 동작하게 됨.
-    currentClips = gltf.animations || [];
-    currentMixer = currentClips.length ? new THREE.AnimationMixer(currentModel) : null;
+    currentClips = bundle.clips;
+    currentMixer = bundle.mixer;
+    // 캐시돼서 재사용되는 캐릭터라도 항상 0프레임(기본 포즈)에서 다시 시작하도록 매번 재적용 —
+    // 본 자체는 몇 개뿐이라 순회/바운딩박스 계산과 달리 이 작업은 원래도 가벼움.
     if(currentMixer){
       currentClips.forEach(clip => currentMixer.clipAction(clip).play());
       currentMixer.setTime(0);
       currentMixer.stopAllAction();
     }
-    gestureCooldownUntil = 0;
     prevPalmPoints = null;
     updateGestureGuideVisibility();
 
-    currentModel.traverse(o=>{
-      if(o.isMesh && o.morphTargetDictionary && Object.keys(o.morphTargetDictionary).length){
-        morphMeshes.push({ mesh:o, dict:o.morphTargetDictionary });
-      }
-    });
-
-    fixTransparencyLayering(currentModel);
-    repairAsymmetricMorphs(currentModel, morphRepairEnabled);
-
+    morphMeshes = bundle.morphMeshes;
     buildMorphPanel();
 
-    headBone = findHeadBone(currentModel);
-    headBoneRestQuat = headBone ? headBone.quaternion.clone() : null;
+    headBone = bundle.headBone;
+    headBoneRestQuat = bundle.headBoneRestQuat;
 
     // 캐릭터마다 키가 달라도 항상 같은 화면 위치에 오도록, 머리 본의 월드 Y가 기준값과 같아지게 모델을 위/아래로 재조정
     if(headBone){
@@ -2142,143 +2422,40 @@ function loadGLBFromArrayBuffer(buffer, onDone){
     modelBasePos.copy(currentModel.position);
     applyModelOffset();
 
-    chestBone = findChestBone(currentModel);
-    chestRestQuat = chestBone ? chestBone.quaternion.clone() : null;
+    chestBone = bundle.chestBone; chestRestQuat = bundle.chestRestQuat;
+    spine02Bone = bundle.spine02Bone; spine02RestQuat = bundle.spine02RestQuat;
+    spine01Bone = bundle.spine01Bone; spine01RestQuat = bundle.spine01RestQuat;
+    breastBoneL = bundle.breastBoneL; breastRestQuatL = bundle.breastRestQuatL;
+    breastBoneR = bundle.breastBoneR; breastRestQuatR = bundle.breastRestQuatR;
 
-    spine02Bone = findSpineSegment(currentModel, 2);
-    spine02RestQuat = spine02Bone ? spine02Bone.quaternion.clone() : null;
-    spine01Bone = findSpineSegment(currentModel, 1);
-    spine01RestQuat = spine01Bone ? spine01Bone.quaternion.clone() : null;
-
-    breastBoneL = findBreastBone(currentModel, 'L');
-    breastRestQuatL = breastBoneL ? breastBoneL.quaternion.clone() : null;
-    breastBoneR = findBreastBone(currentModel, 'R');
-    breastRestQuatR = breastBoneR ? breastBoneR.quaternion.clone() : null;
-
-    // 팔 본 탐색 (ORG- 접두사가 있어도/없어도 매칭, 실패하면 퍼지 매칭으로 fallback)
-    armBones.shoulderL = findBoneExact(currentModel, /^(?:ORG-)?shoulder\.?L(\.\d+)?$/i);
-    armBones.upperArmL = findBoneExact(currentModel, /^(?:ORG-)?upper_?arm\.?L(\.\d+)?$/i);
-    armBones.forearmL  = findBoneExact(currentModel, /^(?:ORG-)?forearm\.?L(\.\d+)?$/i);
-    armBones.shoulderR = findBoneExact(currentModel, /^(?:ORG-)?shoulder\.?R(\.\d+)?$/i);
-    armBones.upperArmR = findBoneExact(currentModel, /^(?:ORG-)?upper_?arm\.?R(\.\d+)?$/i);
-    armBones.forearmR  = findBoneExact(currentModel, /^(?:ORG-)?forearm\.?R(\.\d+)?$/i);
-    armBones.handL = findBoneExact(currentModel, /^(?:ORG-)?hand\.?L(\.\d+)?$/i);
-    armBones.handR = findBoneExact(currentModel, /^(?:ORG-)?hand\.?R(\.\d+)?$/i);
-
-    // 팔-몸통/머리 충돌 감지용 콜라이더: 유니티 콜라이더처럼 대략적인 도형을 손으로 만드는 대신,
-    // 실제 이 캐릭터의 메시 정점(몸통은 가슴·척추·어깨, 머리는 머리 본에 가장 많이 붙어있는 정점)으로부터 바운딩 박스를 직접 만듦
-    computeArmColliders(currentModel);
-
-    // 손가락 본 탐색: rigify 표준 이름 — 엄지는 thumb.01~03, 나머지는 f_index/f_middle/f_ring/f_pinky.01~03 (.L/.R)
-    fingerBones = { L:{}, R:{} };
-    fingerRestQuats = { L:{}, R:{} };
-    let fingerFound = 0;
-    ['L','R'].forEach(side=>{
-      FINGER_NAMES.forEach(finger=>{
-        // rigify식(f_index.01.L)과 이 프로젝트 캐릭터들이 실제로 쓰는 이름(index01L, thumb01L 등) 둘 다 매칭
-        const bones = [1,2,3].map(seg=>
-          findBoneExact(currentModel, new RegExp(`^(?:ORG-)?f?_?${finger}\\.?0${seg}\\.?${side}(\\.\\d+)?$`,'i'))
-        );
-        fingerBones[side][finger] = bones;
-        fingerRestQuats[side][finger] = bones.map(b=> b ? b.quaternion.clone() : null);
-        fingerFound += bones.filter(Boolean).length;
-      });
-    });
-    fingerFoundCount = fingerFound;
-
-    // 머리카락 본 탐색: hair.01~04.L/R 또는 hair01~04L/R (점 있어도/없어도 매칭)
-    hairBones = {};
-    hairRestQuats = {};
-    hairSwingState = {};
-    ['L','R'].forEach(side=>{
-      const bones = [1,2,3,4].map(seg=>
-        findBoneExact(currentModel, new RegExp(`^(?:ORG-)?hair\\.?0${seg}\\.?${side}(\\.\\d+)?$`,'i'))
-      );
-      hairBones[side] = bones;
-      hairRestQuats[side] = bones.map(b=> b ? b.quaternion.clone() : null);
-      hairSwingState[side] = bones.map(()=> ({ x:0,vx:0, y:0,vy:0, z:0,vz:0 }));
-    });
-    let hairFound = (hairBones.L||[]).filter(Boolean).length + (hairBones.R||[]).filter(Boolean).length;
-
-    // 좌우 구분 있는 이름을 못 찾았으면, 좌우 구분 없는 단일 체인(hair, hair.01, hair.02...)도 시도
-    if(hairFound === 0){
-      const centerBones = [1,2,3,4].map(seg=>
-        findBoneExact(currentModel, new RegExp(`^(?:ORG-)?hair\\.?0${seg}(\\.\\d+)?$`,'i'))
-      );
-      if(centerBones.some(Boolean)){
-        hairBones.C = centerBones;
-        hairRestQuats.C = centerBones.map(b=> b ? b.quaternion.clone() : null);
-        hairSwingState.C = centerBones.map(()=> ({ x:0,vx:0, y:0,vy:0, z:0,vz:0 }));
-        hairFound = centerBones.filter(Boolean).length;
-      }
-    }
-    document.getElementById('hair-count').textContent = `(${hairFound}/8)`;
-    if(typeof prevHeadEuler !== 'undefined') prevHeadEuler = { x:0, y:0, z:0 };
-
-    // 요청하신 대로: 포포를 뺀 나머지 캐릭터(부부·피피·링링)는 왼쪽 머리카락 체인(hair.01~04.L)을
-    // 이름이 딱 맞지 않아 자동으로 못 찾는 경우가 있어서, 실제 본 이름(hair01~04)으로 직접 지정해줌.
-    // 자동 매핑이 이미 잘 찾았으면 덮어쓰지 않고, 못 찾은 자리만 채워 넣음.
-    if(pendingRestoreKey && pendingRestoreKey !== 'PoPo_Blend_Shape.glb'){
-      const forcedHairNames = ['hair01','hair02','hair03','hair04'];
-      if(!hairBones.L) hairBones.L = [null,null,null,null];
-      if(!hairRestQuats.L) hairRestQuats.L = [null,null,null,null];
-      if(!hairSwingState.L) hairSwingState.L = [0,1,2,3].map(()=>({x:0,vx:0,y:0,vy:0,z:0,vz:0}));
-      forcedHairNames.forEach((boneName, seg)=>{
-        if(hairBones.L[seg]) return; // 이미 자동으로 찾은 자리는 그대로 둠
-        const found = findBoneByName(currentModel, boneName);
-        if(found){
-          hairBones.L[seg] = found;
-          hairRestQuats.L[seg] = found.quaternion.clone();
-        }
-      });
-      hairFound = (hairBones.L||[]).filter(Boolean).length + (hairBones.R||[]).filter(Boolean).length + (hairBones.C||[]).filter(Boolean).length;
-      document.getElementById('hair-count').textContent = `(${hairFound}/8)`;
-    }
-
-
-    // 눈 관련 본 처리: 이름이 "eye"로 시작하는 본(eyebrow 제외)을 찾음
-    // 이런 본이 머리 본의 자식이 아니면(리그 루트에 따로 달려 있으면) 고개를 돌릴 때 눈만 제자리에 남음.
-    // 예전엔 매 프레임 머리 회전값을 그대로 곱해줬는데, 그러면 "머리 피벗"이 아니라 "그 본 자기 위치"를
-    // 중심으로 돌아서 고개를 돌릴수록 눈이 어긋났음. 그래서 아예 머리 본의 자식으로 옮겨 붙임(월드 위치는 유지).
-    eyeSlaveBones = [];
-    if(headBone){
-      const strays = [];
-      currentModel.traverse(o=>{
-        if((o.isBone || o.type === 'Bone') && /^eye(?!brow)/i.test(o.name)){
-          // 이미 머리 본 아래에 있으면 그대로 두면 됨 (자동으로 따라감)
-          let p = o.parent, isUnderHead = false;
-          while(p){ if(p === headBone){ isUnderHead = true; break; } p = p.parent; }
-          if(!isUnderHead) strays.push(o);
-        }
-      });
-      // attach()는 월드 변환(위치/회전)을 유지한 채 부모만 바꿔주므로 바인드 포즈가 깨지지 않음
-      strays.forEach(b=>{ try{ headBone.attach(b); }catch(err){ console.warn('눈 본 재부모화 실패:', b.name, err); } });
-      if(strays.length) console.info(`눈 본 ${strays.length}개를 머리 본에 붙였어요:`, strays.map(b=>b.name).join(', '));
-    }
-
-    document.getElementById('shoulder-count').textContent = `(${(armBones.shoulderL?1:0)+(armBones.shoulderR?1:0)}/2)`;
-
-    armRestQuats = {};
-    Object.keys(armBones).forEach(k=>{
-      if(armBones[k]) armRestQuats[k] = armBones[k].quaternion.clone();
-    });
-    // [IK 실험] 위팔→팔꿈치, 아래팔→손목 각 본이 쉬는 자세에서 향하던 방향을 캐시
-    function ikBoneForwardLocal(childBone){
-      if(!childBone) return null;
-      const d = childBone.position.clone();
-      return d.lengthSq() > 1e-10 ? d.normalize() : null;
-    }
-    armBoneForwardLocal = {
-      upperArmL: ikBoneForwardLocal(armBones.forearmL),
-      upperArmR: ikBoneForwardLocal(armBones.forearmR),
-      forearmL: ikBoneForwardLocal(armBones.handL),
-      forearmR: ikBoneForwardLocal(armBones.handR)
-    };
+    armBones = bundle.armBones;
+    armRestQuats = bundle.armRestQuats;
+    armBoneForwardLocal = bundle.armBoneForwardLocal;
     ikSmoothedLocalQuat = { upperArmL:null, upperArmR:null, forearmL:null, forearmR:null };
-    const armsFound = Object.values(armBones).filter(Boolean).length;
-    armsFoundCount = armsFound;
+    armsFoundCount = bundle.armsFoundCount;
     document.getElementById('chk-shoulder-track').disabled = !(armBones.shoulderL || armBones.shoulderR);
     shoulderBaseline = { L:null, R:null };
+
+    torsoLocalBox = bundle.colliders.torsoLocalBox; torsoRefBone = bundle.colliders.torsoRefBone;
+    headLocalBox = bundle.colliders.headLocalBox; headRefBone = bundle.colliders.headRefBone;
+
+    fingerBones = bundle.fingerBones;
+    fingerRestQuats = bundle.fingerRestQuats;
+    fingerFoundCount = bundle.fingerFoundCount;
+
+    // 머리카락 스프링 물리 상태는 매번 새로 쉬는 자세(속도 0)로 시작 — 캐시된 캐릭터로 돌아왔을 때도 동일하게 동작
+    hairBones = bundle.hairBones;
+    hairRestQuats = bundle.hairRestQuats;
+    hairSwingState = {};
+    Object.keys(hairBones).forEach(side=>{
+      hairSwingState[side] = hairBones[side].map(()=> ({ x:0,vx:0, y:0,vy:0, z:0,vz:0 }));
+    });
+    document.getElementById('hair-count').textContent = `(${bundle.hairFound}/8)`;
+    if(typeof prevHeadEuler !== 'undefined') prevHeadEuler = { x:0, y:0, z:0 };
+
+    eyeSlaveBones = bundle.eyeSlaveBones;
+
+    document.getElementById('shoulder-count').textContent = `(${(armBones.shoulderL?1:0)+(armBones.shoulderR?1:0)}/2)`;
 
     // 어떤 본을 실제로 찾았는지(또는 못 찾았는지) 화면에 바로 보이게 표시 — 스크린샷 없이도 바로 진단 가능
     const debugLines = [
@@ -2293,9 +2470,12 @@ function loadGLBFromArrayBuffer(buffer, onDone){
     document.getElementById('btn-start-cam').disabled = false;
     document.getElementById('btn-refit-camera').disabled = false;
     document.getElementById('btn-reload-model').disabled = false;
-    setStatus(true, `모프 ${countTotalMorphs()}개 · 머리본 ${headBone?'✓':'✗'} · 팔본 ${armsFound}/6`);
+    setStatus(true, `모프 ${countTotalMorphs()}개 · 머리본 ${headBone?'✓':'✗'} · 팔본 ${armsFoundCount}/6`);
 
     buildBoneMappingPanel();
+
+    // 화면에 처음 보여준 캐릭터라면, 나머지 캐릭터들을 백그라운드에서 미리 준비시켜둠
+    scheduleBackgroundCharacterPrestage();
 
     // 이 캐릭터(고유 id 기준)에 저장된 설정이 있으면 복원, 없으면 기본값(있을 때)을 적용.
     // 화면 메시지에는 id(내부용 임의 문자열)가 아니라 사람이 알아보기 쉬운 파일명을 보여줌.
@@ -2347,6 +2527,24 @@ function loadGLBFromArrayBuffer(buffer, onDone){
     // 위치 고정을 켠 캐릭터는 여기서 아무것도 건드리지 않음 — 위에서 restoreSettings()로 이미
     // 불러온, 직접 맞춰서 저장해두신 위치·크기가 그대로 유지됨.
 
+    // 피피 머리카락 찰랑임 5개 값은 저장된 설정이 뭐든 상관없이 로드될 때마다 이 값으로 강제 고정함
+    // (자꾸 드리프트된다고 하셔서, 매번 확실히 이 수치로 맞춰지도록 함)
+    {
+      const builtinNameForHairLock = (activeCharIndex >= 0 && characterFiles[activeCharIndex]) ? characterFiles[activeCharIndex].name : null;
+      if(builtinNameForHairLock === 'PiPi_Blend_Shape.glb'){
+        const hairLock = { 's-hair-sway':'0.15', 's-hair-stiff':'140', 's-hair-damp':'11.0', 's-hair-idle':'0.5', 's-hair-idle-speed':'0.10' };
+        Object.entries(hairLock).forEach(([id, val])=>{
+          const el = document.getElementById(id);
+          if(el) el.value = val;
+        });
+        const vSway = document.getElementById('v-hair-sway'); if(vSway) vSway.textContent = '0.15';
+        const vStiff = document.getElementById('v-hair-stiff'); if(vStiff) vStiff.textContent = '140';
+        const vDamp = document.getElementById('v-hair-damp'); if(vDamp) vDamp.textContent = '11.0';
+        const vIdle = document.getElementById('v-hair-idle'); if(vIdle) vIdle.textContent = '0.5°';
+        const vIdleSpeed = document.getElementById('v-hair-idle-speed'); if(vIdleSpeed) vIdleSpeed.textContent = '0.10';
+      }
+    }
+
     // 카메라를 전신 프레이밍 — modelOffset(특히 크기 배율)이 이 캐릭터의 최종값으로 이미 반영된
     // "다음"에 계산해야 정확함(그래야 지금 크기 그대로 화면에 꽉 차게 맞춰짐).
     // "랜덤 캐릭터 뽑기" 버튼을 누르기 전까지는 화면에 아무 캐릭터도 없이 대기하는데, 그 사이
@@ -2370,13 +2568,6 @@ function loadGLBFromArrayBuffer(buffer, onDone){
       snapCharacterToBottomAnchor();
       scheduleAutosave();
     }
-    if(typeof onDone === 'function') onDone();
-  }, (err)=>{
-    console.error(err);
-    setStatus(false, 'GLB 파싱 실패');
-    alert('GLB 파일을 읽는 중 문제가 발생했어요. Shape Keys / Skinning 옵션을 체크하고 다시 내보내보세요.');
-    if(typeof onDone === 'function') onDone(err);
-  });
 }
 
 function countTotalMorphs(){
@@ -3759,7 +3950,7 @@ function loadCharacterByIndex(idx, onDone){
   activeCharIndex = idx;
   pendingRestoreKey = characterFiles[idx].id; // 새 캐릭터 로드가 끝나면 이 id로 저장된 설정을 복원 시도
   setStatus(true, `로딩 중… ${characterFiles[idx].name}`);
-  loadGLBFromArrayBuffer(characterFiles[idx].buffer, onDone);
+  loadGLBFromArrayBuffer(characterFiles[idx].buffer, characterFiles[idx].id, onDone);
   buildCharListUI();
 }
 
@@ -3826,7 +4017,7 @@ let sessionStarted = false;
 // (내장 캐릭터가 아닌, 직접 추가한 캐릭터들은 이 순서 뒤에 이어서 붙음)
 const AUTO_CYCLE_ORDER = ['bubu_Blend_Shape.glb', 'RingRing_Blend_Shape.glb', 'PoPo_Blend_Shape.glb', 'PiPi_Blend_Shape.glb'];
 
-// 순서상 다음 캐릭터로 전환 (게이팅 없이 바로 실행). onDone은 로드가 완전히 끝난 뒤 호출됨.
+// 순서상 다음 캐릭터로 전환. onDone은 로드가 완전히 끝난 뒤 호출됨.
 function advanceCharacterInOrder(onDone){
   if(characterFiles.length === 0) return;
   if(characterFiles.length === 1){ loadCharacterByIndex(0, onDone); return; }
@@ -4515,6 +4706,15 @@ async function loadEmbeddedCharacters(){
       // 내장 캐릭터는 항상 같은 파일명을 가진 고정된 하나뿐인 캐릭터이므로,
       // id를 파일명과 동일하게 둬서 그동안 캐릭터별로 저장해둔 위치/설정이 계속 그대로 적용되게 함.
       characterFiles.push({ id: name, name, buffer });
+
+      // [최적화] 여기서 미리 한 번 파싱해서 캐시해두면, 나중에 이 캐릭터로 "전환"할 때
+      // 무거운 GLB 디코딩을 다시 안 하고 바로 화면에 꺼내 쓸 수 있어서 훨씬 빠르게 넘어감.
+      try{
+        const gltf = await new Promise((resolve, reject)=> loader.parse(buffer, '', resolve, reject));
+        parsedGltfCache[name] = gltf;
+      }catch(err2){
+        console.error('내장 캐릭터 미리 파싱 실패(전환 시 다시 시도됨):', name, err2);
+      }
     }catch(err){
       console.error('내장 캐릭터 로드 실패:', name, err);
     }
@@ -4656,6 +4856,11 @@ const chkMorphRepair = document.getElementById('chk-morph-repair');
 chkMorphRepair.addEventListener('change', ()=>{
   morphRepairEnabled = chkMorphRepair.checked;
   if(currentModel) repairAsymmetricMorphs(currentModel, morphRepairEnabled);
+  // 백그라운드에 미리 준비해둔 다른 캐릭터들도 최신 설정으로 맞춰둠 (전환했을 때 예전 값이 남지 않게)
+  Object.keys(characterRigCache).forEach(id=>{
+    const bundle = characterRigCache[id];
+    if(bundle && bundle.model && bundle.model !== currentModel) repairAsymmetricMorphs(bundle.model, morphRepairEnabled, false);
+  });
 });
 const chkMouthCloseDefault = document.getElementById('chk-mouthclose-default');
 let neutralDefaultOn = true;
@@ -4770,14 +4975,9 @@ async function startWebcam(){
     setStatus(true, '표정 인식 중');
     requestAnimationFrame(predictLoop);
 
-    // 팔/손가락 본을 찾은 캐릭터라면 poseLandmarker를 켜서 좌표 인식은 시작함 — 09번 제스처 인식이 이 좌표를 씀.
-    // [일시 비활성화] 다만 bodyTrackEnabled는 여기서 자동으로 켜지 않음 — 팔을 실시간으로 직접 움직이는 건
-    // 아직 꺼둔 상태(웹캠 팔 트래킹 자체를 다시 쓰려면 아래에 bodyTrackEnabled = true; 를 추가하면 됨).
-    if(armsFoundCount > 0){
-      try{
-        if(!poseLandmarker) await initPoseLandmarker();
-      }catch(e){ console.error('몸 트래킹 모델 로딩 실패:', e); }
-    }
+    // [최적화] poseLandmarker(몸 랜드마크)는 이제 아무 데도 안 써서 아예 안 켬 — 매 프레임 도는
+    // 무거운 인식 모델 하나를 통째로 줄여서 특히 저사양 기기에서 부담을 덜어줌.
+    // (제스처 인식은 09번처럼 손 랜드마크만 씀. 웹캠 팔 실시간 트래킹을 다시 쓰게 되면 여기서 다시 켜면 됨.)
     if(fingerFoundCount > 0){
       try{
         if(!handLandmarker) await initHandLandmarker();
@@ -4898,15 +5098,17 @@ let headRefBone = null;
 
 // 몸통·머리 콜라이더를 한 번의 메시 순회로 같이 만듦 (예전엔 각각 따로 모델 전체를 순회해서
 // 정점이 많은 캐릭터에서 캐릭터 전환마다 눈에 띄는 끊김이 있었음 — 순회를 하나로 합쳐서 절반으로 줄임).
-function computeArmColliders(model){
-  torsoLocalBox = null; torsoRefBone = null;
-  headLocalBox = null; headRefBone = null;
+// [최적화] 전역 상태를 직접 읽고 쓰지 않고 본을 파라미터로 받아 결과를 반환하는 순수 함수로 만들어서,
+// 지금 화면에 보이는 캐릭터가 아니어도(예: 백그라운드로 미리 준비 중인 다음 캐릭터) 안전하게 호출할 수 있음.
+function computeArmCollidersFor(model, bones){
+  const { chestBone, spine01Bone, spine02Bone, armBones, headBone } = bones;
+  let torsoLocalBoxR = null, torsoRefBoneR = null, headLocalBoxR = null, headRefBoneR = null;
 
   const torsoRef = chestBone || spine01Bone;
   const headRef = headBone;
   const torsoBones = torsoRef ? new Set([chestBone, spine01Bone, spine02Bone, armBones.shoulderL, armBones.shoulderR].filter(Boolean)) : null;
   const headBones = headRef ? new Set([headRef]) : null;
-  if(!torsoRef && !headRef) return;
+  if(!torsoRef && !headRef) return { torsoLocalBox:null, torsoRefBone:null, headLocalBox:null, headRefBone:null };
 
   model.updateMatrixWorld(true);
   const torsoBox = torsoRef ? new THREE.Box3() : null;
@@ -4955,8 +5157,9 @@ function computeArmColliders(model){
     }
   });
 
-  if(torsoFound && isFinite(torsoBox.min.x) && isFinite(torsoBox.max.x)){ torsoLocalBox = torsoBox; torsoRefBone = torsoRef; }
-  if(headFound && isFinite(headBox.min.x) && isFinite(headBox.max.x)){ headLocalBox = headBox; headRefBone = headRef; }
+  if(torsoFound && isFinite(torsoBox.min.x) && isFinite(torsoBox.max.x)){ torsoLocalBoxR = torsoBox; torsoRefBoneR = torsoRef; }
+  if(headFound && isFinite(headBox.min.x) && isFinite(headBox.max.x)){ headLocalBoxR = headBox; headRefBoneR = headRef; }
+  return { torsoLocalBox: torsoLocalBoxR, torsoRefBone: torsoRefBoneR, headLocalBox: headLocalBoxR, headRefBone: headRefBoneR };
 }
 
 const _p1 = new THREE.Vector3(), _elbowWorldPos = new THREE.Vector3(), _handWorldPos = new THREE.Vector3();
@@ -5376,8 +5579,63 @@ function isAnyClipPlaying(){
   });
 }
 
+// ---------------------------------------------------------------
+// 기본자세(idle 숨쉬기·머리카락 흔들림) ↔ 애니메이션 재생 전환을 부드럽게 이어붙임.
+// 어깨/척추/가슴/머리카락 본은 idle 쪽과 애니메이션 쪽이 서로 독립적으로 자세를 계산해서,
+// 그냥 뚝 바꾸면 위치가 안 맞아 "뚜둑" 튀어보임. 그래서 전환 시작 시점의 자세를 스냅샷 떠두고,
+// 짧은 시간(BONE_TRANSITION_MS) 동안 그 자세에서 "이번 프레임에 새로 계산된 자세"로 서서히 섞어줌.
+// ---------------------------------------------------------------
+const BONE_TRANSITION_MS = 350;
+let boneTransition = null; // { fromQuats: Map<Bone, Quaternion>, startTime }
+let wasClipPlayingLastFrame = false;
+
+function getTransitionBones(){
+  // 팔(위팔·아래팔·손)도 넣어야 함 — 애니메이션이 연달아 재생될 때(예: 손동작 감지가 다시 트리거될 때)
+  // 이전 클립이 끝난 자세(마지막 프레임에 멈춘 팔 위치)에서 새 클립의 0프레임으로 팔이 훅 튀는 게
+  // 이 목록에 없어서 안 부드러웠던 부분 — 어깨/척추/머리카락만큼 눈에 띄는 곳이라 같이 추가함.
+  const bones = [
+    armBones.shoulderL, armBones.shoulderR,
+    armBones.upperArmL, armBones.upperArmR,
+    armBones.forearmL, armBones.forearmR,
+    armBones.handL, armBones.handR,
+    spine01Bone, spine02Bone, chestBone, breastBoneL, breastBoneR,
+  ];
+  ['L','R','C'].forEach(side=>{
+    (hairBones[side] || []).forEach(b => bones.push(b));
+  });
+  ['L','R'].forEach(side=>{
+    FINGER_NAMES.forEach(finger=>{
+      (fingerBones[side] && fingerBones[side][finger] || []).forEach(b => bones.push(b));
+    });
+  });
+  return bones.filter(Boolean);
+}
+
+function startBoneTransition(){
+  const bones = getTransitionBones();
+  if(!bones.length) return;
+  const fromQuats = new Map();
+  bones.forEach(b => fromQuats.set(b, b.quaternion.clone()));
+  boneTransition = { fromQuats, startTime: performance.now() };
+}
+
+// currentMixer.update()나 updateShoulderIdle/updateHairPhysics가 이번 프레임의 "목표 자세"를
+// 이미 본에 세팅해둔 다음에 호출해야 함 — 그 목표값과 스냅샷해둔 이전 자세 사이를 보간해서 다시 세팅함.
+function applyBoneTransitionBlend(){
+  if(!boneTransition) return;
+  const t = (performance.now() - boneTransition.startTime) / BONE_TRANSITION_MS;
+  if(t >= 1){ boneTransition = null; return; }
+  const smooth = t * t * (3 - 2 * t); // smoothstep — 시작/끝이 더 자연스럽게
+  boneTransition.fromQuats.forEach((fromQuat, bone)=>{
+    const targetQuat = _transitionTargetQuat.copy(bone.quaternion);
+    bone.quaternion.copy(fromQuat).slerp(targetQuat, smooth);
+  });
+}
+const _transitionTargetQuat = new THREE.Quaternion();
+
 function playCurrentClips(){
   if(!currentMixer || !currentClips.length) return;
+  startBoneTransition(); // 지금(idle) 자세를 스냅샷 떠서, 애니메이션 시작 자세로 부드럽게 이어붙일 준비
   currentClips.forEach(clip=>{
     const action = currentMixer.clipAction(clip);
     action.reset();
@@ -5651,18 +5909,12 @@ function predictLoop(){
         applyIdleFace(); // 얼굴 없으면 눈 감은 기본 표정으로
       }
     }
-    if(poseLandmarker){
-      const poseResult = poseLandmarker.detectForVideo(videoEl, now);
-      // 팔을 실제로 움직이는 건 bodyTrackEnabled일 때만(지금은 꺼둔 상태) — 하지만 포즈 좌표 자체는
-      // 제스처 인식(09번 섹션)에서 항상 필요해서, 감지 자체는 계속 돌려둠.
-      if(bodyTrackEnabled) applyBodyResult(poseResult);
-      try{ detectGesture(); }catch(e){ /* 캐릭터 전환 중 잠깐 어긋날 수 있어 무시 */ }
-    }
     if(handLandmarker){
       const handResult = handLandmarker.detectForVideo(videoEl, now);
-      lastHandResult = handResult; // 제스처 인식(피피 퍼먹기 등)은 handTrackEnabled와 무관하게 항상 최신 값을 씀
+      lastHandResult = handResult; // 제스처 인식은 handTrackEnabled와 무관하게 항상 최신 값을 씀
       if(handTrackEnabled) applyHandResult(handResult);
       try{ drawHandSkeleton(handResult); }catch(e){ /* 캐릭터 전환 중 잠깐 어긋날 수 있어 무시 */ }
+      try{ detectGesture(); }catch(e){ /* 캐릭터 전환 중 잠깐 어긋날 수 있어 무시 */ }
     }
   }
   updateSleepIndicator();
