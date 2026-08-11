@@ -8,15 +8,15 @@
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;700;800&display=swap');
 
   :root{
-    --bg: #0b0d10;
-    --panel: #14171b;
-    --panel-2: #1b1f24;
-    --line: #262b31;
-    --text: #e7ebee;
-    --dim: #8b939c;
-    --accent: #7CFFB2;
-    --accent-dim: #3d5c4a;
-    --warn: #ff8a6a;
+    --bg: #f6f4ee;
+    --panel: #fbfaf6;
+    --panel-2: #eee9dd;
+    --line: #ddd6c4;
+    --text: #3a372e;
+    --dim: #746c5c;
+    --accent: #B8CCC4;
+    --accent-dim: #c3dbcd;
+    --warn: #c8603f;
   }
   *{ box-sizing: border-box; }
   html,body{
@@ -136,7 +136,8 @@
 
   /* ---------- side panel ---------- */
   #panel{
-    width:340px; min-width:280px; max-width:640px; background:var(--panel); border-left:1px solid var(--line);
+    width:340px; min-width:280px; max-width:640px; background:rgba(251,250,246,0.55); backdrop-filter:blur(6px);
+    border-left:1px solid var(--line);
     display:flex; flex-direction:column; height:100%; position:relative;
   }
   #panel.collapsed{ width:0 !important; min-width:0 !important; border-left:none; overflow:hidden; }
@@ -186,7 +187,7 @@
     transition:.15s;
   }
   button.action:hover{ border-color:var(--accent); }
-  button.action.primary{ background:var(--accent); color:#08110c; border-color:var(--accent); }
+  button.action.primary{ background:var(--accent); color:var(--text); border-color:var(--accent); }
   button.action.primary:hover{ filter:brightness(1.08); }
   button.action:disabled{ opacity:.4; cursor:not-allowed; }
   button.action + button.action{ margin-top:8px; }
@@ -211,7 +212,7 @@
   }
   input[type=range]::-webkit-slider-thumb{
     -webkit-appearance:none; width:14px; height:14px; border-radius:50%; background:var(--accent); cursor:pointer;
-    border:2px solid #08110c;
+    border:2px solid var(--text);
   }
 
   .morph-row{
@@ -242,7 +243,7 @@
   .footer-note{ padding:14px 20px; border-top:1px solid var(--line); font-size:10.5px; color:var(--dim); line-height:1.6; }
   .footer-note b{ color:var(--text); }
 
-  ::selection{ background:var(--accent); color:#08110c; }
+  ::selection{ background:var(--accent); color:var(--text); }
 </style>
 </head>
 <body>
@@ -281,8 +282,8 @@
 
     <button id="btn-random-char-overlay" title="랜덤 캐릭터 뽑기" style="
       position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); z-index:9;
-      padding:14px 22px; border-radius:100px; border:1px solid rgba(124,255,178,0.5);
-      background:rgba(20,23,27,0.55); backdrop-filter:blur(3px); color:var(--text);
+      padding:14px 22px; border-radius:100px; border:1px solid rgba(184,204,196,0.5);
+      background:rgba(255,255,255,0.22); backdrop-filter:blur(3px); color:var(--text);
       font-weight:700; font-size:14px; cursor:pointer; box-shadow:0 8px 24px rgba(0,0,0,.35);
       display:flex; align-items:center; gap:8px; opacity:0.85;
     ">랜덤 캐릭터 뽑기</button>
