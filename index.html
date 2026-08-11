@@ -146,11 +146,18 @@
   #panel-resize-handle:hover{ background:linear-gradient(90deg, transparent, var(--accent)); opacity:.4; }
   #panel-toggle{
     position:fixed; top:14px; right:8px; width:30px; height:30px; z-index:300;
-    background:var(--panel); border:1px solid var(--line); border-radius:8px; color:var(--text);
+    background:rgba(255,255,255,0.22); backdrop-filter:blur(4px); border:1px solid rgba(255,255,255,0.35); border-radius:8px;
     cursor:pointer; font-size:15px; display:flex; align-items:center; justify-content:center;
-    box-shadow:0 2px 10px rgba(0,0,0,.35);
+    box-shadow:0 2px 10px rgba(0,0,0,.2);
   }
-  #panel-toggle:hover{ border-color:var(--accent); color:var(--accent); }
+  #panel-toggle:hover{ background:rgba(255,255,255,0.32); }
+  #btn-fullscreen-toggle{
+    position:fixed; top:14px; left:14px; width:34px; height:34px; z-index:300;
+    background:rgba(255,255,255,0.22); backdrop-filter:blur(4px); border:1px solid rgba(255,255,255,0.35); border-radius:8px;
+    cursor:pointer; font-size:16px; display:flex; align-items:center; justify-content:center;
+    box-shadow:0 2px 10px rgba(0,0,0,.2);
+  }
+  #btn-fullscreen-toggle:hover{ background:rgba(255,255,255,0.32); }
   #panel-header{ padding:20px 20px 14px; border-bottom:1px solid var(--line); }
   #panel-header .eyebrow{ font-size:10px; letter-spacing:.14em; color:var(--accent); text-transform:uppercase; font-weight:700; }
   #panel-header h2{ margin:6px 0 0; font-size:18px; font-weight:800; }
@@ -284,6 +291,7 @@
   <div id="panel">
     <div id="panel-resize-handle"></div>
     <button id="panel-toggle" title="설정 패널 접기/펼치기">⮞</button>
+    <button id="btn-fullscreen-toggle" title="전체화면 (주소창 등 브라우저 UI 숨기기)">⛶</button>
     <div id="panel-header">
       <div class="eyebrow">Face Puppet</div>
       <h2>표정 미러링 컨트롤</h2>
@@ -1123,6 +1131,10 @@ function positionPanelToggle(){
   panelToggle.title = collapsed ? '설정 패널 펼치기 (단축키: H 또는 \\)' : '설정 패널 접기 (단축키: H 또는 \\)';
   // 패널을 접으면 화살표만 남기고, 상단의 상태 표시(모프 개수 등)도 같이 숨김 — 깔끔한 캡처 화면용
   document.getElementById('top-status').style.display = collapsed ? 'none' : 'flex';
+  // 전체화면 버튼도 같이 숨김 — 패널을 접는 목적 자체가 깔끔한 화면이라 이 버튼도 예외 없음
+  // (설정 패널을 다시 열 수 있는 ⮜/⮞ 화살표만 남겨둠)
+  const btnFs = document.getElementById('btn-fullscreen-toggle');
+  if(btnFs) btnFs.style.display = collapsed ? 'none' : 'flex';
 }
 
 function togglePanel(){
@@ -1138,6 +1150,38 @@ function togglePanel(){
 panelToggle.addEventListener('click', togglePanel);
 positionPanelToggle();
 window.addEventListener('resize', positionPanelToggle);
+
+// ---- 전체화면 (주소창·탭 등 브라우저 UI까지 숨김) ----
+// 브라우저마다 API 이름이 달라서(특히 예전 사파리) 접두사 붙은 버전까지 다 시도함.
+// iOS 사파리는 임의 요소의 전체화면 자체를 지원하지 않아서 이 버튼이 안 먹힐 수 있음.
+const btnFullscreenToggle = document.getElementById('btn-fullscreen-toggle');
+function isFullscreenActive(){
+  return !!(document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || document.msFullscreenElement);
+}
+function enterFullscreen(){
+  const el = document.documentElement;
+  const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+  if(!req) return;
+  const result = req.call(el);
+  if(result && typeof result.catch === 'function') result.catch(()=>{});
+}
+function exitFullscreenCompat(){
+  const exit = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen || document.msExitFullscreen;
+  if(exit) exit.call(document);
+}
+function updateFullscreenButton(){
+  const active = isFullscreenActive();
+  btnFullscreenToggle.textContent = active ? '⛝' : '⛶';
+  btnFullscreenToggle.title = active ? '전체화면 종료' : '전체화면 (주소창 등 브라우저 UI 숨기기)';
+}
+btnFullscreenToggle.addEventListener('click', ()=>{
+  if(isFullscreenActive()) exitFullscreenCompat();
+  else enterFullscreen();
+});
+['fullscreenchange','webkitfullscreenchange','mozfullscreenchange','MSFullscreenChange'].forEach(evt=>{
+  document.addEventListener(evt, updateFullscreenButton);
+});
+updateFullscreenButton();
 
 // 키보드 단축키: H 또는 \ 로 패널 접기/펼치기 (입력창에 타이핑 중일 때는 무시)
 window.addEventListener('keydown', (e)=>{
@@ -4825,6 +4869,16 @@ function buildDotBackground(){
 // 도트 배경이 켜져 있는 동안 색상/크기를 바꾸면 바로 다시 그려서 반영
 sDotColor.addEventListener('input', ()=>{ if(bgDotsLayer.style.display !== 'none') buildDotBackground(); });
 sDotSize.addEventListener('input', ()=>{ if(bgDotsLayer.style.display !== 'none') buildDotBackground(); });
+
+// 상단 아이콘 버튼(설정 패널 접기/전체화면)의 아이콘 색을 배경 도트 색과 항상 맞춰줌
+function applyIconButtonColors(){
+  const c = sDotColor.value;
+  panelToggle.style.color = c;
+  const btnFs = document.getElementById('btn-fullscreen-toggle');
+  if(btnFs) btnFs.style.color = c;
+}
+sDotColor.addEventListener('input', applyIconButtonColors);
+applyIconButtonColors();
 
 document.getElementById('btn-bg-dots').addEventListener('click', ()=>{
   bgLayer.style.backgroundImage = 'none';
