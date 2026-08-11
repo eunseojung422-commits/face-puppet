@@ -5050,6 +5050,27 @@ async function startWebcam(){
   }
 }
 
+// 웹캠을 끄는 순간의 고개 각도·표정을 그대로 얼려두면 어색해 보여서, 끌 때 고개와 표정 둘 다
+// 기본(정면·무표정) 자세로 바로 되돌림 — applyIdleFace()처럼 서서히 당기는 게 아니라 즉시 스냅함
+// (웹캠이 꺼지면 predictLoop 자체가 멈춰서 서서히 당기는 루프를 더 돌릴 수가 없기 때문).
+function resetFaceAndHeadToRest(){
+  if(headBone && headBoneRestQuat) headBone.quaternion.copy(headBoneRestQuat);
+  smoothedHeadEuler = { x:0, y:0, z:0 };
+
+  ARKIT_NAMES.forEach(n=>{ smoothedScores[n] = 0; });
+  Object.keys(morphGroups).forEach(key=>{
+    const arkit = morphMapping[key] || 'neutral';
+    const ov = morphOverrides[key] || { gain:1, thresh:0 };
+    const value = computeMorphValue(arkit, 0, ov); // raw=0 → 결과도 항상 0(무표정)
+    morphGroups[key].items.forEach(({meshIdx, morphIdx})=>{
+      const entry = morphMeshes[meshIdx];
+      if(entry && entry.mesh.morphTargetInfluences) entry.mesh.morphTargetInfluences[morphIdx] = value;
+    });
+    const bar = document.getElementById(`bar_${safeDomId(key)}`);
+    if(bar) bar.style.width = '0%';
+  });
+}
+
 function stopWebcam(){
   camRunning = false;
   bodyTrackEnabled = false;
@@ -5059,6 +5080,7 @@ function stopWebcam(){
   document.getElementById('webcam-pip').classList.remove('live');
   document.getElementById('btn-start-cam').textContent = '웹캠 시작';
   setStatus(true, '대기 중');
+  resetFaceAndHeadToRest();
 }
 
 document.getElementById('btn-start-cam').addEventListener('click', ()=>{
