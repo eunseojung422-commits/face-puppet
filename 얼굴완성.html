@@ -4107,10 +4107,14 @@ function startOrAdvanceCharacter(){
     loadCharacterByIndex(startIdx, ()=>{
       loadCharacterByIndex(startIdx, ()=>{
         if(canvasEl) canvasEl.style.visibility = 'visible';
+        // 캐릭터가 다 준비된 직후 웹캠도 같이 켬 — fingerFoundCount가 이 캐릭터 기준으로
+        // 이미 채워진 다음이라 손가락 트래킹 여부도 정확하게 같이 켜짐
+        if(!camRunning) startWebcam();
       });
     });
   } else {
     advanceCharacterInOrder();
+    if(!camRunning) startWebcam();
   }
 }
 
