@@ -1447,7 +1447,6 @@ const parsedGltfCache = {};
 // 한 번이라도 셋업된 캐릭터는 다음에 다시 전환할 때 이 무거운 계산(트리 순회 수십 번 + 정점 단위
 // 바운딩박스 계산)을 다시 안 하고 바로 복원만 하면 돼서 거의 즉시 전환됨.
 const characterRigCache = {};
-let backgroundPrestageScheduled = false;
 let morphMeshes = []; // { mesh, dict, arkitTarget: [name per morph index] }
 let headBone = null;
 let headBoneRestQuat = null;
@@ -2387,13 +2386,19 @@ function computeCharacterRig(gltf, id){
 // 프레임이 끼지 않게) 처리함. 이 방식은 캐릭터당 1초 이상 메인 스레드를 막기 때문에, 앱을 막 켠
 // 직후(사용자가 아직 활발히 상호작용하기 전) 한꺼번에 몰아서 끝내는 걸 택함 — 그 뒤로는 전환이
 // 완전히 매끈해짐.
+// 이 시점까지 파싱은 끝났지만(parsedGltfCache) 아직 본/셰이더 준비는 안 된(characterRigCache에
+// 없는) 캐릭터들을 훑어서 마저 준비시킴. 여러 번 다시 불러도 안전함(그때그때 큐를 새로 만들고,
+// 이미 돌고 있으면 그냥 무시함) — 캐릭터가 아직 다운로드조차 안 끝났으면 이번엔 건너뛰고,
+// 나중에 그 캐릭터 다운로드가 끝난 시점에 다시 호출해주면 그때 마저 처리됨.
+let prestageInFlight = false;
 function scheduleBackgroundCharacterPrestage(){
-  if(backgroundPrestageScheduled) return;
-  backgroundPrestageScheduled = true;
-  const queue = EMBEDDED_CHARACTER_NAMES.filter(name => !characterRigCache[name]);
+  if(prestageInFlight) return;
+  const queue = EMBEDDED_CHARACTER_NAMES.filter(name => parsedGltfCache[name] && !characterRigCache[name]);
+  if(!queue.length) return;
+  prestageInFlight = true;
   let i = 0;
   function step(){
-    if(i >= queue.length) return;
+    if(i >= queue.length){ prestageInFlight = false; return; }
     const name = queue[i++];
     try{
       const gltf = parsedGltfCache[name];
@@ -4744,25 +4749,61 @@ document.getElementById('btn-shoulder-to-all').addEventListener('click', applyCu
 const EMBEDDED_CHARACTER_NAMES = [
   'PiPi_Blend_Shape.glb', 'RingRing_Blend_Shape.glb', 'bubu_Blend_Shape.glb', 'PoPo_Blend_Shape.glb'
 ];
-async function loadEmbeddedCharacters(){
-  setStatus(true, `내장 캐릭터 ${EMBEDDED_CHARACTER_NAMES.length}명 준비 중…`);
-  for(const name of EMBEDDED_CHARACTER_NAMES){
-    try{
-      const res = await fetch(`./character/${name}`, { cache: 'no-cache' });
-      if(!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buffer = await res.arrayBuffer();
-      // 내장 캐릭터는 항상 같은 파일명을 가진 고정된 하나뿐인 캐릭터이므로,
-      // id를 파일명과 동일하게 둬서 그동안 캐릭터별로 저장해둔 위치/설정이 계속 그대로 적용되게 함.
-      characterFiles.push({ id: name, name, buffer });
+// "랜덤 캐릭터 뽑기"를 눌렀을 때 항상 이 캐릭터로 시작하는 관례가 있어서, 4명 중 이 캐릭터만
+// 먼저 받아오면 나머지를 기다리지 않고도 곧바로 정상적인 시작 경험을 줄 수 있음.
+const AUTO_CYCLE_FIRST = 'bubu_Blend_Shape.glb';
 
-      // [최적화] 여기서 미리 한 번 파싱해서 캐시해두면, 나중에 이 캐릭터로 "전환"할 때
-      // 무거운 GLB 디코딩을 다시 안 하고 바로 화면에 꺼내 쓸 수 있어서 훨씬 빠르게 넘어감.
-      try{
-        const gltf = await new Promise((resolve, reject)=> loader.parse(buffer, '', resolve, reject));
-        parsedGltfCache[name] = gltf;
-      }catch(err2){
-        console.error('내장 캐릭터 미리 파싱 실패(전환 시 다시 시도됨):', name, err2);
-      }
+// 캐릭터 하나를 받아와서 파싱까지 끝내고 characterFiles/parsedGltfCache에 채워 넣음.
+async function fetchAndParseEmbeddedCharacter(name){
+  const res = await fetch(`./character/${name}`, { cache: 'no-cache' });
+  if(!res.ok) throw new Error(`HTTP ${res.status}`);
+  const buffer = await res.arrayBuffer();
+  // 내장 캐릭터는 항상 같은 파일명을 가진 고정된 하나뿐인 캐릭터이므로,
+  // id를 파일명과 동일하게 둬서 그동안 캐릭터별로 저장해둔 위치/설정이 계속 그대로 적용되게 함.
+  characterFiles.push({ id: name, name, buffer });
+  // [최적화] 여기서 미리 한 번 파싱해서 캐시해두면, 나중에 이 캐릭터로 "전환"할 때
+  // 무거운 GLB 디코딩을 다시 안 하고 바로 화면에 꺼내 쓸 수 있어서 훨씬 빠르게 넘어감.
+  try{
+    const gltf = await new Promise((resolve, reject)=> loader.parse(buffer, '', resolve, reject));
+    parsedGltfCache[name] = gltf;
+  }catch(err2){
+    console.error('내장 캐릭터 미리 파싱 실패(전환 시 다시 시도됨):', name, err2);
+  }
+}
+
+// [최적화] 예전엔 4명을 전부(약 40MB) 다 받아야 "랜덤 캐릭터 뽑기"가 눌리게 했는데, 그러면
+// 처음 링크를 여는 사람이 캐릭터 하나 보기까지 꽤 오래 기다려야 했음. 이제는 (항상 시작 캐릭터인)
+// 1명만 먼저 받아서 바로 쓸 수 있게 하고, 나머지 3명은 화면이 이미 정상적으로 쓰이는 동안 뒤에서
+// 하나씩 마저 받아옴 — 다 받아질 때마다 목록에 바로 추가되고, 본/셰이더 예열(prestage)도 그 즉시
+// 같이 걸어줌(scheduleBackgroundCharacterPrestage는 여러 번 불러도 안전하게 설계돼 있음).
+function loadRemainingEmbeddedCharactersInBackground(){
+  const already = new Set(characterFiles.map(cf=>cf.name));
+  const remaining = EMBEDDED_CHARACTER_NAMES.filter(n=> !already.has(n));
+  let i = 0;
+  function step(){
+    if(i >= remaining.length) return;
+    const name = remaining[i++];
+    fetchAndParseEmbeddedCharacter(name)
+      .then(()=>{
+        buildCharListUI();
+        setSettingsStatus(`내장 캐릭터 ${characterFiles.length}/${EMBEDDED_CHARACTER_NAMES.length}명 준비됨`);
+        scheduleBackgroundCharacterPrestage();
+      })
+      .catch(err=> console.error('내장 캐릭터 로드 실패:', name, err))
+      .finally(()=> setTimeout(step, 300));
+  }
+  setTimeout(step, 300);
+}
+
+async function loadEmbeddedCharacters(){
+  setStatus(true, '내장 캐릭터 준비 중…');
+  // 시작 캐릭터부터 먼저 시도하고, 혹시 실패하면 나머지 이름들도 하나씩 시도해서
+  // "그중 아무거나 하나라도" 빨리 쓸 수 있게 함(전부 실패해야만 완전히 포기함).
+  const tryOrder = [AUTO_CYCLE_FIRST, ...EMBEDDED_CHARACTER_NAMES.filter(n=> n !== AUTO_CYCLE_FIRST)];
+  for(const name of tryOrder){
+    try{
+      await fetchAndParseEmbeddedCharacter(name);
+      break; // 하나라도 성공하면 바로 화면을 쓸 수 있게 진행 — 나머지는 백그라운드에서 마저 받아옴
     }catch(err){
       console.error('내장 캐릭터 로드 실패:', name, err);
     }
@@ -4772,8 +4813,9 @@ async function loadEmbeddedCharacters(){
   buildCharListUI();
   document.getElementById('hint').style.display = 'none';
   // 요청하신 대로: 캐릭터를 바로 띄우지 않고, "랜덤 캐릭터 뽑기" 버튼을 누를 때까지 배경만 보여줌
-  setStatus(true, `내장 캐릭터 ${characterFiles.length}명 준비됨`);
-  setSettingsStatus(`내장 캐릭터 ${characterFiles.length}명을 준비했어요 — "랜덤 캐릭터 뽑기"를 눌러 시작하세요.`);
+  setStatus(true, `내장 캐릭터 준비됨 (${characterFiles.length}/${EMBEDDED_CHARACTER_NAMES.length})`);
+  setSettingsStatus(`캐릭터 준비 완료 — "랜덤 캐릭터 뽑기"를 눌러 시작하세요. 나머지 캐릭터는 백그라운드에서 마저 받아와요.`);
+  loadRemainingEmbeddedCharactersInBackground(); // await 없이 바로 반환 — 앱을 곧장 쓸 수 있게 함
   return true;
 }
 
