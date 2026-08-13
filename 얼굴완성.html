@@ -28,15 +28,15 @@
   #app{ display:flex; width:100vw; height:100vh; }
 
   /* ---------- viewport ---------- */
-  #viewport{ position:relative; flex:1; min-width:0; background:
-      radial-gradient(circle at 30% 20%, #14181d 0%, #0b0d10 70%);
-      overflow:hidden;
-  }
+  /* 배경 도트/이미지 레이어를 뷰포트 밖(고정 위치, 창 전체)으로 옮겨서 설정창 뒤까지 깔리게 하고,
+     뷰포트·패널은 그 위에 오도록 z-index를 줌 — 그래야 패널의 반투명 배경이 진짜로 그 도트를
+     블러 처리해서 비춰줌(가짜로 복제한 무늬가 아니라 실제 같은 배경이 비치는 유리 느낌). */
+  #viewport{ position:relative; z-index:1; flex:1; min-width:0; overflow:hidden; }
   #bg-image-layer{
-    position:absolute; inset:0; background-size:cover; background-position:center;
+    position:fixed; inset:0; background-size:cover; background-position:center;
     background-repeat:no-repeat; z-index:0; transition:opacity .3s;
   }
-  #bg-dots-layer{ position:absolute; inset:0; z-index:0; overflow:hidden; background:#f5f4ef; }
+  #bg-dots-layer{ position:fixed; inset:0; z-index:0; overflow:hidden; background:#f5f4ef; }
   .bg-dot{
     position:absolute; border-radius:50%;
     animation-name:dot-pulse; animation-timing-function:ease-in-out; animation-iteration-count:infinite;
@@ -138,15 +138,7 @@
   #panel{
     width:340px; min-width:280px; max-width:640px; background:rgba(251,250,246,0.22); backdrop-filter:blur(6px);
     border-left:1px solid var(--line);
-    display:flex; flex-direction:column; height:100%; position:relative;
-  }
-  /* 설정창 자체 뒤에 도트 배경이 없어서(도트는 캐릭터 화면 쪽에만 그려짐) 투명도를 줘도 안 비쳤던 부분 —
-     같은 색·간격의 점무늬를 패널 안쪽에 따로 깔아서, 반투명 배경 너머로 도트가 비치는 것처럼 보이게 함. */
-  #panel-dots-layer{
-    position:absolute; inset:0; z-index:0; overflow:hidden; pointer-events:none;
-    background-image: radial-gradient(circle, var(--accent) 3px, transparent 3.5px);
-    background-size: 28px 28px;
-    opacity:0.45;
+    display:flex; flex-direction:column; height:100%; position:relative; z-index:1;
   }
   #panel.collapsed{ width:0 !important; min-width:0 !important; border-left:none; overflow:hidden; }
   #panel-resize-handle{
@@ -167,11 +159,11 @@
     box-shadow:0 2px 10px rgba(0,0,0,.2);
   }
   #btn-fullscreen-toggle:hover{ background:rgba(255,255,255,0.32); }
-  #panel-header{ position:relative; z-index:1; padding:20px 20px 14px; border-bottom:1px solid var(--line); }
+  #panel-header{ padding:20px 20px 14px; border-bottom:1px solid var(--line); }
   #panel-header .eyebrow{ font-size:10px; letter-spacing:.14em; color:var(--accent); text-transform:uppercase; font-weight:700; }
   #panel-header h2{ margin:6px 0 0; font-size:18px; font-weight:800; }
 
-  #panel-body{ position:relative; z-index:1; flex:1; overflow-y:auto; padding:16px 20px; }
+  #panel-body{ flex:1; overflow-y:auto; padding:16px 20px; }
   #panel-body::-webkit-scrollbar{ width:6px; }
   #panel-body::-webkit-scrollbar-thumb{ background:var(--line); border-radius:3px; }
 
@@ -301,7 +293,6 @@
   </div>
 
   <div id="panel">
-    <div id="panel-dots-layer"></div>
     <div id="panel-resize-handle"></div>
     <div id="panel-header">
       <div class="eyebrow">Face Puppet</div>
