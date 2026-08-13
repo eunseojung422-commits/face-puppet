@@ -126,7 +126,7 @@
   .drop-zone .small{ font-size:12px; color:var(--dim); margin-top:4px; }
 
   #top-status{
-    position:absolute; top:20px; right:20px; display:flex; gap:8px;
+    position:absolute; top:56px; right:20px; display:flex; gap:8px;
   }
   .pill{
     font-size:11px; padding:6px 12px; border-radius:100px; background:var(--panel);
@@ -136,7 +136,7 @@
 
   /* ---------- side panel ---------- */
   #panel{
-    width:340px; min-width:280px; max-width:640px; background:rgba(251,250,246,0.55); backdrop-filter:blur(6px);
+    width:340px; min-width:280px; max-width:640px; background:rgba(251,250,246,0.4); backdrop-filter:blur(6px);
     border-left:1px solid var(--line);
     display:flex; flex-direction:column; height:100%; position:relative;
   }
@@ -250,6 +250,9 @@
 
 <div id="app">
 
+  <button id="panel-toggle" title="설정 패널 접기/펼치기">⮞</button>
+  <button id="btn-fullscreen-toggle" title="전체화면 (주소창 등 브라우저 UI 숨기기)">⛶</button>
+
   <div id="viewport">
     <div id="bg-image-layer"></div>
     <div id="bg-dots-layer" style="display:none;"></div>
@@ -291,8 +294,6 @@
 
   <div id="panel">
     <div id="panel-resize-handle"></div>
-    <button id="panel-toggle" title="설정 패널 접기/펼치기">⮞</button>
-    <button id="btn-fullscreen-toggle" title="전체화면 (주소창 등 브라우저 UI 숨기기)">⛶</button>
     <div id="panel-header">
       <div class="eyebrow">Face Puppet</div>
       <h2>표정 미러링 컨트롤</h2>
